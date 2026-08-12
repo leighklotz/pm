@@ -2,29 +2,54 @@
 
 ### How it works
 ### 
-### * No `SPAN` → whole file, default 5 min bins.
-### * With a span the end is `now`, start is computed with GNU `date`:
-###   * `hour` = now - 1 hour
-###   * `day`  = now - 1 day
-###   * `week` = now - 1 week
-###   * `month`= now - 1 month
-###   * `ytd`  = 1 Jan of current year 00:00
-### * `BIN_WIDTH = DURATION / 120` with a 30 s floor, so the plot stays readable for hour → year-to-date.
-### 
-### Examples
-### 
-### ./energy-monitor-plot.sh /var/log/energy-monitor/energy-monitor.log hour
-### ./energy-monitor-plot.sh /var/log/energy-monitor/energy-monitor.log day
-### ./energy-monitor-plot.sh /var/log/energy-monitor/energy-monitor.log week
-### ./energy-monitor-plot.sh /var/log/energy-monitor/energy-monitor.log month
-### ./energy-monitor-plot.sh /var/log/energy-monitor/energy-monitor.log ytd
-### ./energy-monitor-plot.sh               # whole file
+### * No `--span` → whole file, default 5 min bins.
+### * With a span (e.g., --span=day) the end is `now`, start is computed with GNU `date`:
+###   * hour  = now - 1 hour
+###   * day   = now - 1 day
+###   * week  = now - 1 week
+###   * month = now - 1 month
+###   * ytd   = 1 Jan of current year 00:00
+### * `BIN_WIDTH = DURATION / 120` with a 30 s floor.
 ### 
 
 DEFAULT_LOG="/var/log/energy-monitor/energy-monitor.log"
-FILE="${1:-$DEFAULT_LOG}"
-SPAN="${2:-}"
 
+# --- Argument Parsing ---
+FILE="$DEFAULT_LOG"
+SPAN=""
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --span=*) # Matches --span=day, --span=hour, etc.
+            SPAN="${1#*=}"
+            shift
+            ;;
+        --span)   # Matches --span day (with a space)
+            if [ -n "$2" ] && [[ "$2" != --* ]]; then
+                SPAN="$2"
+                shift 2
+            else
+                echo "Error: --span requires an argument (hour, day, week, month, ytd)"
+                exit 1
+            fi
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--span=<interval>] [logfile]"
+            echo "Intervals: hour, day, week, month, ytd"
+            exit 0
+            ;;
+        -*) # Error on unknown flags
+            echo "Error: Unknown option $1"
+            exit 1
+            ;;
+        *) # Positional argument is treated as the log file
+            FILE="$1"
+            shift
+            ;;
+    esac
+done
+
+# --- Validation ---
 if [ ! -f "$FILE" ]; then
     echo "Error: File $FILE not found."
     exit 1
@@ -42,7 +67,7 @@ if [ -n "$SPAN" ]; then
         week)         START_EPOCH=$(date -d "1 week ago"  +%s) ;;
         month)        START_EPOCH=$(date -d "1 month ago" +%s) ;;
         ytd|year-to-date) START_EPOCH=$(date -d "$(date +%Y)-01-01 00:00:00" +%s) ;;
-        *) echo "Span must be one of hour day week month ytd"; exit 1 ;;
+        *) echo "Error: Span must be one of hour, day, week, month, ytd"; exit 1 ;;
     esac
 
     DURATION=$(( END_EPOCH - START_EPOCH ))
