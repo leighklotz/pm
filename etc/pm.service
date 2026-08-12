@@ -1,5 +1,5 @@
 [Unit]
-Description=Energy Monitor Script
+Description=Power Monitor Script
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ User=klotz
 Type=simple
 Restart=always
 RestartSec=5
-ExecStart=/home/klotz/wip/energy-monitor/lib/daemon.sh
+ExecStart=/home/klotz/wip/pm/lib/daemon.sh
 
 StandardOutput=append:/var/log/pm/pm.log
 StandardError=inherit 

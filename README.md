@@ -4,7 +4,7 @@ A lightweight monitoring system to track real-time power consumption from a smar
 
 ## Sample Output
 ```bash
-klotz@tensor:~/wip/energy-monitor🦶$ ./bin/pm-plot
+klotz@tensor:~/wip/pm🦶$ ./bin/pm-plot
                                                  Cost ($)    $   Power (*) +-----+                                                  
                                                                                                                                     
                                            Energy Usage: whole file (/var/log/pm/pm.log)                                            
