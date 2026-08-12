@@ -9,7 +9,6 @@ Type=simple
 Restart=always
 RestartSec=5
 # Force shell redirection so that the file gets raw, clean script strings
-ExecStart=/bin/sh -c '/home/klotz/wip/energy-monitor/energy-monitor.sh >> /var/log/energy-monitor/energy-monitor.log 2>&1'
-
+ExecStart=/bin/sh -c '/home/klotz/wip/energy-monitor/lib/daemon.sh >> /var/log/pm/monitor.log 2>&1'
 [Install]
 WantedBy=multi-user.target

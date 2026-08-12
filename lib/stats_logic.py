@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from statistics import mean
 
 # Default file path if no arguments are provided
-DEFAULT_FILE = "/var/log/energy-monitor/energy-monitor.log"
+DEFAULT_FILE = "/var/log/pm/monitor.log"
 
 def analyze_energy(file_path):
     data = []
