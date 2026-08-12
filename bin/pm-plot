@@ -5,7 +5,7 @@
 ### * With a span → end is `now`, start is computed with GNU `date`.
 ### * BIN_WIDTH matches the terminal plot size to prevent character overlap.
 
-DEFAULT_LOG="/var/log/pm/pm-monitor.log"
+DEFAULT_LOG="/var/log/pm/pm.log"
 
 # --- Argument Parsing ---
 FILE="$DEFAULT_LOG"
