@@ -1,6 +1,41 @@
-# Energy Monitor
+# pm - Power Monitor
 
 A lightweight monitoring system to track real-time power consumption from a smart plug via an API, log the data, and provide tools for analysis and visualization.
+
+## Sample Output
+```bash
+klotz@tensor:~/wip/energy-monitor🦶$ ./bin/pm-plot
+                                                 Cost ($)    $   Power (*) +-----+                                                  
+                                                                                                                                    
+                                           Energy Usage: whole file (/var/log/pm/pm.log)                                            
+     0.008 +-----------------------------------------------------------------------------------------------------------+ 500        
+           |       +        +    +-++       +-++     +       +       +       +        +  + +-++       +    +   $$$     |            
+           |                    +  |        |  |                                         |    +           +|$$       +-| 450        
+     0.007 |-+                  |  |        |  |                                         |    |          + |           |            
+           |                    |  |       |   |                                         |    |     $$$ $| |           |            
+     0.006 |-+                  |  |       |   |                                         |    |$ $$      | |         +-| 400        
+           |                    |  |       +   |                                         |   $|          | |           |            
+           |                   |   |       |   |                                        |  $  |          | |         +-| 350        
+     0.005 |-+                 |    |      |    |                                       | $   |          |  |          |            
+           |                   |    |      |    |                                       |$     |         |  |          |            
+           |                   |    |     |     |                                 $$$ $$|      |         |  |        +-| 300        
+     0.004 |-+                 |    |     |     |                    $ $ $ $$$ $$       |      |         |  |        * (Watts/Power)
+           |                   |    |     |     |         $$ $$ $$$ $                   |      |         |  |        +-| 250        
+           |                   |    |     |     | $$ $ $ $                              |      |        |   |          |            
+     0.003 |-+                 |    |     |   $$|                                       |      |        |   |          |            
+           |                   |    ++    | $   +                                       |      +-+      |   ++       +-| 200        
+     0.002 |-+                 |     |    |$    |                                       |        |      |    |         |            
+           |                  |      $|$$$|      |                                     |         |      |     |      +-| 150        
+           |                  |    $$ |  |       |                                     |          |     |     |        |            
+     0.001 |-+                |  $    |  |       |                       +             |          |     |     |        |            
+           |                  | $      | |        |                     + +            |          |     |      |     +-| 100        
+           |      ++-+++-++-+++     +  +++  +     ++-+-+-+++-++-+++-++-+   +++-++-+++-++      +   +-+++-+      +++     |            
+         0 +-----------------------------------------------------------------------------------------------------------+ 50         
+         10:00   11:00    12:00   13:00   14:00    15:00   16:00   17:00   18:00    19:00   20:00   21:00    22:00   23:00          
+                                                               Time                                                                 
+```                                                                                                                                    
+
+
 
 ## Features
 - **Automated Logging**: Runs as a `systemd` service to capture power metrics (Power, Voltage, Current, Total Energy) every 10 seconds in CSV format.
@@ -18,13 +53,14 @@ Ensure the following tools are installed on your system:
 
 1. **Clone the repository** (or place these files in your desired directory).
 2. **Configure the Service**: 
-   Open `energy-monitor.service` and ensure the `ExecStart` path matches the actual absolute path of your `energy-monitor.sh` script on your machine.
+   Open `/etc/pm.service` and ensure the `ExecStart` path matches the actual absolute path of your `lib/daemon.sh` script on your machine.
 3. **Run the Install Script**: 
    This will configure the systemd service, reload the daemon, and start monitoring. This requires `sudo` privileges.
    ```bash
-   chmod +x *.sh
-   ./energy-monitor-install.sh
+   chmod +x install.sh bin/*
+   ./install.sh
    ```
+
 
 ## Usage
 
@@ -32,47 +68,37 @@ Ensure the following tools are installed on your system:
 The monitoring script runs automatically as a background service configured to restart on failure.
 ```bash
 # Check service status
-systemctl status energy-monitor.service
+systemctl status pm.service
 
 # View real-time logs
-tail -f /var/log/energy-monitor/energy-monitor.log
+tail -f /var/log/pm/pm.log
 ```
 
 ### 2. Plotting Data (One-off)
 To see a terminal-based line graph of the power consumption over time:
 ```bash
-./energy-monitor-plot.sh [/path/to/your/logfile]
+bin/pm-plot [/path/to/your/logfile]
 ```
-*(Defaults to `/var/log/energy-monitor/energy-monitor.log` if no argument is provided)*
+*(Defaults to `/var/log/pm/pm.log` if no argument is provided)*
 
 ### 3. Watching Data (Live Update)
 To run the plot in a loop, updating every 10 seconds:
 ```bash
-$ ./watch-plot.sh
-
-            Power over Time (/var/log/energy-monitor/energy-monitor.log)
-     450 +-----------------------------------------------------------------+
-         |       +        + *     +       +       +     *  +       * *   * |
-     400 |-+                *                           *Power *W) *******-|
-         |                  **                          *      *   * *   * |
-     350 |-+                **                          **     *   * * **-|
-              \            / \                        /    \   *  * * / 
-               \          /   \                      /      \ * /  * /  
-                \________/     \____________________/        \__/__/   
-      50 +-----------------------------------------------------------------+
-       04:00   05:00    06:00   07:00   08:00   09:00    10:00   11:00   12:00
+bin/pm-watch
+```
 
 ### 4. Analyzing Averages
-Run the Python analysis engine to generate statistical reports for a specific log file:
+Run the statistical engine to generate reports for a specific log file:
 ```bash
-# Uses default /var/log/energy-monitor/energy-monitor.log if no argument is provided
-python3 power-avg.py [/path/to/your/logfile]
+# Uses default /var/log/pm/pm.log if no argument is provided
+bin/pm-stats [/path/to/your/logfile]
 ```
 
 ## File Descriptions
-- `energy-monitor.sh`: The core script that polls the API and writes CSV data to a log file.
-- `energy-monitor.service`: Systemd unit file for persistent background execution.
-- `energy-monitor-install.sh`: Helper script to automate service installation and setup.
-- `energy-monitor-plot.sh`: Bash script using `gnuplot` to render ASCII line charts.
-- `watch-plot.sh`: A wrapper that uses `watch` to refresh the plot automatically.
-- `power-avg.py`: Python engine for calculating statistical averages across various time windows.
+- `lib/daemon.sh`: The core script that polls the API and writes CSV data to a log file.
+- `/etc/pm.service`: Systemd unit file for persistent background execution.
+- `./install.sh`: Helper script to automate service installation and setup.
+- `bin/pm-plot`: Bash script using `gnuplot` to render ASCII line charts.
+- `bin/pm-watch`: A wrapper that uses `watch` to refresh the plot automatically.
+- `bin/pm-stats`: Python engine for calculating statistical averages across various time windows with visual bar trends.
+```
