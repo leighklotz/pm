@@ -1,2 +1,2 @@
 #!/bin/bash
-watch -n 10 "$(dirname "$0")/pm-plot; $(dirname "$0")/pm-stats"
+watch -n 10 "$(dirname "$0")/pm-plot --span=month; $(dirname "$0")/pm-stats --span=month"

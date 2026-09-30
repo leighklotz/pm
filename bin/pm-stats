@@ -1,1 +1,333 @@
-../lib/stats_logic.py
+#!/usr/bin/env python3
+import csv
+import glob
+import gzip
+import math
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from statistics import mean
+
+DEFAULT_LOG_BASE = "/var/log/pm/pm.log"
+VALID_SPANS = ("hour", "day", "week", "month", "ytd", "year-to-date")
+
+
+def usage(prog, stream=sys.stdout):
+    print(
+        f"Usage: {prog} [--span=<interval>] [logfile ...]\n"
+        "Intervals: hour, day, week, month, ytd",
+        file=stream,
+    )
+
+
+def parse_args(argv):
+    """Parse the same --span forms accepted by pm-plot."""
+    span = None
+    files = []
+    i = 1
+
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg.startswith("--span="):
+            span = arg.split("=", 1)[1]
+            if not span:
+                print(
+                    "Error: --span requires an argument (hour, day, week, month, ytd)",
+                    file=sys.stderr,
+                )
+                return None
+            i += 1
+        elif arg == "--span":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                print(
+                    "Error: --span requires an argument (hour, day, week, month, ytd)",
+                    file=sys.stderr,
+                )
+                return None
+            span = argv[i + 1]
+            i += 2
+        elif arg in ("-h", "--help"):
+            usage(argv[0])
+            raise SystemExit(0)
+        elif arg.startswith("-"):
+            print(f"Error: Unknown option {arg}", file=sys.stderr)
+            return None
+        else:
+            files.append(arg)
+            i += 1
+
+    if span is not None:
+        span = span.lower()
+        if span not in VALID_SPANS:
+            print(
+                "Error: Span must be one of hour, day, week, month, ytd",
+                file=sys.stderr,
+            )
+            return None
+
+    return span, files
+
+
+def span_epoch_range(span):
+    """Return [start,end) epoch bounds using GNU date, matching pm-plot."""
+    if span is None:
+        return None, None
+
+    if span == "hour":
+        expr = "1 hour ago"
+    elif span == "day":
+        expr = "1 day ago"
+    elif span == "week":
+        expr = "1 week ago"
+    elif span == "month":
+        expr = "1 month ago"
+    elif span in ("ytd", "year-to-date"):
+        expr = f"{datetime.now().year}-01-01 00:00:00"
+    else:
+        raise ValueError(f"unsupported span: {span}")
+
+    try:
+        start = int(
+            subprocess.check_output(
+                ["date", "-d", expr, "+%s"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+        end = int(
+            subprocess.check_output(
+                ["date", "+%s"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        raise RuntimeError(f"unable to calculate --span={span}: {exc}") from exc
+
+    return start, end
+
+
+def parse_timestamp(ts_raw):
+    """Parse a log timestamp and always return an aware datetime."""
+    try:
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except ValueError:
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(ts_raw, fmt)
+                break
+            except ValueError:
+                pass
+        if dt is None:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+
+    return dt
+
+
+def open_log(file_path):
+    """Open a plain or gzip-compressed log as text."""
+    if file_path.endswith(".gz"):
+        return gzip.open(file_path, mode="rt", encoding="utf-8", errors="replace")
+    return open(file_path, mode="r", encoding="utf-8", errors="replace")
+
+
+def load_data(file_paths, start_epoch=None, end_epoch=None):
+    """Read plain/gzip logs, apply an optional span, and sort by timestamp."""
+    combined_data = []
+
+    for file_path in file_paths:
+        try:
+            with open_log(file_path) as f:
+                for row in csv.reader(f):
+                    # Headers may occur anywhere. A data row begins YYYY-.
+                    if (
+                        not row
+                        or len(row) < 6
+                        or len(row[0]) < 5
+                        or not row[0][:4].isdigit()
+                        or row[0][4] != "-"
+                    ):
+                        continue
+
+                    ts = parse_timestamp(row[0])
+                    if ts is None:
+                        continue
+
+                    epoch = ts.timestamp()
+                    if start_epoch is not None and epoch < start_epoch:
+                        continue
+                    if end_epoch is not None and epoch >= end_epoch:
+                        continue
+
+                    try:
+                        power_val = float(row[2])
+                        energy_kwh = float(row[5])
+                    except (ValueError, IndexError):
+                        continue
+
+                    if not math.isfinite(power_val) or not math.isfinite(energy_kwh):
+                        continue
+
+                    combined_data.append(
+                        {
+                            "timestamp": ts,
+                            "power_w": power_val,
+                            "energy_kwh": energy_kwh,
+                        }
+                    )
+        except FileNotFoundError:
+            print(f"Warning: {file_path} not found. Skipping...", file=sys.stderr)
+        except (OSError, gzip.BadGzipFile) as e:
+            print(f"Error reading {file_path}: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}", file=sys.stderr)
+
+    combined_data.sort(key=lambda x: x["timestamp"])
+    return combined_data
+
+
+def sample_average(data):
+    """Arithmetic mean of recorded power samples."""
+    return mean(d["power_w"] for d in data) if data else 0.0
+
+
+def meter_average(data):
+    """Average watts from cumulative meter energy over endpoint elapsed time."""
+    if len(data) < 2:
+        return None
+
+    first = data[0]
+    last = data[-1]
+    elapsed_hours = (last["timestamp"] - first["timestamp"]).total_seconds() / 3600.0
+    energy_kwh = last["energy_kwh"] - first["energy_kwh"]
+
+    if elapsed_hours <= 0 or energy_kwh < 0:
+        return None
+
+    return energy_kwh * 1000.0 / elapsed_hours
+
+
+def analyze_energy(all_data, source_info):
+    """Perform sample-average and meter-derived analysis on selected data."""
+    if not all_data:
+        print("\nNo valid data found in the selected time range.")
+        return 1
+
+    last_time = all_data[-1]["timestamp"]
+    first_ts = all_data[0]["timestamp"]
+
+    metrics = [
+        ("Average Power (Last 10 Min)", last_time - timedelta(minutes=10)),
+        ("Average Power (Last Hour)", last_time - timedelta(hours=1)),
+        ("Average Power (Last Day)", last_time - timedelta(days=1)),
+        ("Average Power (Last Week)", last_time - timedelta(weeks=1)),
+        (
+            "Average Power (MTD)",
+            last_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+        ),
+        (
+            "Average Power (YTD)",
+            last_time.replace(
+                month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+            ),
+        ),
+    ]
+
+    print(f"\n--- Statistics ({source_info}) ---")
+
+    avg_all = sample_average(all_data)
+    weighted_all = meter_average(all_data)
+
+    print(f"Sample Average:            {avg_all:.2f} W")
+    if weighted_all is not None:
+        delta = weighted_all - avg_all
+        pct = (delta / avg_all * 100.0) if avg_all else 0.0
+        print(f"Time-Weighted Average:     {weighted_all:.2f} W")
+        print(f"Difference:                {delta:+.2f} W ({pct:+.1f}%)")
+    else:
+        print("Time-Weighted Average:     unavailable")
+    print()
+
+    plot_results = []
+    for label, threshold in metrics:
+        # Only show windows fully covered by the selected data.
+        if threshold < first_ts:
+            continue
+
+        period_data = [d for d in all_data if d["timestamp"] >= threshold]
+        if not period_data:
+            continue
+
+        sample_avg = sample_average(period_data)
+        weighted_avg = meter_average(period_data)
+        plot_results.append((label, sample_avg, weighted_avg))
+
+    if not plot_results:
+        print("No period-specific metrics available (logs may be too short).")
+    else:
+        max_val = max([r[1] for r in plot_results] + [avg_all])
+        bar_width = 54
+
+        print(
+            f"{'Metric':<28} | {'Visual Trend (Sample Avg)':<{bar_width}} | "
+            "Sample    Meter"
+        )
+        print("-" * (31 + bar_width + 24))
+
+        for label, sample_avg, weighted_avg in plot_results:
+            scaled_len = int((sample_avg / max_val) * bar_width) if max_val > 0 else 0
+            bar = "█" * scaled_len
+            meter_text = (
+                f"{weighted_avg:>7.2f} W" if weighted_avg is not None else "     n/a"
+            )
+            print(
+                f"{label:<28} | {bar:<{bar_width}} | "
+                f"{sample_avg:>7.2f} W  {meter_text}"
+            )
+
+    print()
+    print(f"Data Range:  {first_ts} to {last_time}")
+    print(f"Total Records Analyzed: {len(all_data)}")
+    return 0
+
+
+def main(argv):
+    parsed = parse_args(argv)
+    if parsed is None:
+        usage(argv[0], stream=sys.stderr)
+        return 2
+
+    span, explicit_files = parsed
+
+    try:
+        start_epoch, end_epoch = span_epoch_range(span)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    if explicit_files:
+        files_to_process = explicit_files
+        source_label = f"Specific Files ({', '.join(files_to_process)})"
+    else:
+        pattern = DEFAULT_LOG_BASE + "*"
+        files_to_process = sorted(glob.glob(pattern))
+        source_label = f"All logs matching {DEFAULT_LOG_BASE}*"
+
+    if not files_to_process:
+        print("Error: No log files found.", file=sys.stderr)
+        return 1
+
+    if span:
+        source_label = f"{span} ({source_label})"
+
+    data = load_data(files_to_process, start_epoch, end_epoch)
+    return analyze_energy(data, source_label)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
