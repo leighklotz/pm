@@ -7,14 +7,17 @@ SPAN=""
 MODE="both"
 COST_PER_KWH=0.25
 
-while [[ "$#" -gt 0 ]]; do
+while (( $# > 0 )); do
     case "$1" in
         --span=*)
             SPAN="${1#*=}"
             shift
             ;;
         --span)
-            [[ "$#" -ge 2 ]] || { echo "Error: --span requires an argument." >&2; exit 2; }
+            (( $# >= 2 )) || {
+                echo "Error: --span requires an argument." >&2
+                exit 2
+            }
             SPAN="$2"
             shift 2
             ;;
@@ -37,7 +40,10 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-[[ -f "$FILE" ]] || { echo "Error: File $FILE not found." >&2; exit 1; }
+[[ -f "$FILE" ]] || {
+    echo "Error: File $FILE not found." >&2
+    exit 1
+}
 
 # --- Time Range Calculation ---
 TERM_WIDTH=132
@@ -49,54 +55,87 @@ END_EPOCH=$(date +%s)
 
 if [[ -n "$SPAN" ]]; then
     case "${SPAN,,}" in
-        hour)  START_EPOCH=$(date -d "1 hour ago" +%s) ;;
-        day)   START_EPOCH=$(date -d "1 day ago" +%s) ;;
-        week)  START_EPOCH=$(date -d "1 week ago" +%s) ;;
-        month) START_EPOCH=$(date -d "1 month ago" +%s) ;;
+        hour)
+            START_EPOCH=$(date -d "1 hour ago" +%s)
+            ;;
+        day)
+            START_EPOCH=$(date -d "1 day ago" +%s)
+            ;;
+        week)
+            START_EPOCH=$(date -d "1 week ago" +%s)
+            ;;
+        month)
+            START_EPOCH=$(date -d "1 month ago" +%s)
+            ;;
         ytd|year-to-date)
             START_EPOCH=$(date -d "$(date +%Y)-01-01 00:00:00" +%s)
             ;;
         *)
-            echo "Error: Unknown span '$SPAN'. Use hour, day, week, month, or ytd." >&2
+            echo "Error: Unknown span '$SPAN'." >&2
+            echo "Use: hour, day, week, month, or ytd." >&2
             exit 2
             ;;
     esac
 else
-    FIRST_LINE=$(awk -F, '$1 ~ /^[0-9]{4}-/ { print; exit }' "$FILE")
-    LAST_LINE=$(awk -F, '$1 ~ /^[0-9]{4}-/ { line=$0 } END { if (line != "") print line }' "$FILE")
+    FIRST_LINE=$(
+        awk -F, '$1 ~ /^[0-9]{4}-/ { print; exit }' "$FILE"
+    )
+
+    LAST_LINE=$(
+        awk -F, '
+            $1 ~ /^[0-9]{4}-/ { line=$0 }
+            END { if (line != "") print line }
+        ' "$FILE"
+    )
 
     [[ -n "$FIRST_LINE" && -n "$LAST_LINE" ]] || {
         echo "Error: No data rows found in $FILE." >&2
         exit 1
     }
 
-    START_EPOCH=$(awk -F, '{
-        dt=substr($1,1,19)
-        gsub(/[-T:]/, " ", dt)
-        print mktime(dt)
-    }' <<< "$FIRST_LINE")
+    START_EPOCH=$(
+        awk -F, '{
+            dt=substr($1,1,19)
+            gsub(/[-T:]/, " ", dt)
+            print mktime(dt)
+        }' <<< "$FIRST_LINE"
+    )
 
-    # Include the last recorded sample.
-    END_EPOCH=$(awk -F, '{
-        dt=substr($1,1,19)
-        gsub(/[-T:]/, " ", dt)
-        print mktime(dt) + 1
-    }' <<< "$LAST_LINE")
+    END_EPOCH=$(
+        awk -F, '{
+            dt=substr($1,1,19)
+            gsub(/[-T:]/, " ", dt)
+            print mktime(dt) + 1
+        }' <<< "$LAST_LINE"
+    )
 fi
 
 DURATION=$(( END_EPOCH - START_EPOCH ))
 (( DURATION < 60 )) && DURATION=60
+
 BIN_WIDTH=$(( DURATION / TARGET_BINS ))
 (( BIN_WIDTH < 1 )) && BIN_WIDTH=1
 
-# --- Data Processing (AWK) ---
-# Column 3: instantaneous power in watts.
-# Column 6: meter cumulative energy in kWh.
+# --- Data Processing ---
 #
-# Power is averaged into display bins. Cost is derived independently from
-# the meter's cumulative-energy counter, so changing TARGET_BINS does not
-# change the total cost. If the meter energy counter resets, a decrease is
-# treated as a reset and accumulation continues from the new value.
+# CSV fields:
+#
+#   1 timestamp
+#   2 plug
+#   3 power_w
+#   4 voltage_v
+#   5 current_a
+#   6 energy_kwh
+#
+# Header lines may appear anywhere in the file.  A real sample begins
+# with a four-digit year followed by "-".
+#
+# Power is averaged into display bins.
+#
+# Cost comes directly from the meter's cumulative energy counter.
+# Therefore TARGET_BINS affects only the appearance of the power trace,
+# not the calculated energy cost.
+
 TMP_DATA=$(mktemp)
 trap 'rm -f "$TMP_DATA"' EXIT
 
@@ -105,9 +144,15 @@ awk -F, \
     -v end="$END_EPOCH" \
     -v bw="$BIN_WIDTH" \
     -v rate="$COST_PER_KWH" '
-BEGIN { OFS=" " }
 
-$1 !~ /^[0-9]{4}-/ { next }
+BEGIN {
+    OFS=" "
+}
+
+# Ignore headers, blank lines, and anything else that is not a data row.
+$1 !~ /^[0-9]{4}-/ {
+    next
+}
 
 {
     dt = substr($1, 1, 19)
@@ -120,39 +165,49 @@ $1 !~ /^[0-9]{4}-/ { next }
     watts = $3 + 0
     energy = $6 + 0
 
-    # Accumulate energy from raw samples, independently of display bins.
-    if (!have_prev) {
-        prev_energy = energy
-        have_prev = 1
-    } else {
-        delta = energy - prev_energy
-        if (delta >= 0)
-            used_kwh += delta
-        else
-            used_kwh += energy   # cumulative counter reset
-        prev_energy = energy
+    # The first energy reading in the selected range is our cost baseline.
+    if (!have_first_energy) {
+        first_energy = energy
+        have_first_energy = 1
     }
 
+    # Display bin relative to the selected start time.
     bin = int((epoch - start) / bw)
     btime = start + bin * bw
 
     sum_w[bin] += watts
-    cnt_w[bin]++
+    count_w[bin]++
 
-    # Keep cumulative cost at the latest raw sample in each display bin.
-    cost[bin] = used_kwh * rate
+    # Keep the most recent cumulative meter value in each bin.
+    last_energy[bin] = energy
     time_of_bin[bin] = btime
 }
 
 END {
+    if (!have_first_energy)
+        exit
+
     n = asorti(time_of_bin, keys, "@ind_num_asc")
+
     for (i = 1; i <= n; i++) {
         b = keys[i]
-        avg_w = sum_w[b] / cnt_w[b]
+
+        avg_w = sum_w[b] / count_w[b]
+
+        used_kwh = last_energy[b] - first_energy
+
+        # The meter should be monotonic.  Do not display negative cost
+        # should a malformed sample ever get through.
+        if (used_kwh < 0)
+            used_kwh = 0
+
+        running_cost = used_kwh * rate
+
         cmd = "date -d @" time_of_bin[b] " +%Y-%m-%dT%H:%M:%S"
         cmd | getline t
         close(cmd)
-        print t, avg_w, cost[b]
+
+        print t, avg_w, running_cost
     }
 }
 ' "$FILE" > "$TMP_DATA"
@@ -162,18 +217,18 @@ END {
     exit 1
 }
 
-# --- Visualization (Gnuplot) ---
+# --- Visualization ---
 SPAN_LABEL=${SPAN:-whole file}
 
 if [[ "$MODE" == "both" ]]; then
     gnuplot <<EOF
         set xdata time; set timefmt '%Y-%m-%dT%H:%M:%S';
         set title 'Energy Usage: $SPAN_LABEL ($FILE)';
-        set xlabel 'Time'; set ylabel '\$ Cumulative';
+        set xlabel 'Time'; set ylabel '$ Cumulative';
         set key outside bottom center horizontal;
         set y2label '* (Watts/Power)'; set ytics nomirror; set y2tics;
         set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi;
-        plot '$TMP_DATA' using 1:3 with points pt '\$' title 'Cost (\$)', \
+        plot '$TMP_DATA' using 1:3 with points pt '\$' title 'Cost ($)', \
              '' using 1:2 axis x1y2 with lines title 'Power (*)'
 EOF
 
@@ -181,9 +236,9 @@ elif [[ "$MODE" == "cost" ]]; then
     gnuplot <<EOF
         set xdata time; set timefmt '%Y-%m-%dT%H:%M:%S';
         set title 'Cumulative Cost: $SPAN_LABEL ($FILE)';
-        set xlabel 'Time'; set ylabel '\$ Cumulative';
+        set xlabel 'Time'; set ylabel '$ Cumulative';
         set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi;
-        plot '$TMP_DATA' using 1:3 with lines title 'Cost (\$)'
+        plot '$TMP_DATA' using 1:3 with lines title 'Cost ($)'
 EOF
 
 elif [[ "$MODE" == "power" ]]; then
