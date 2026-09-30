@@ -1,191 +1,253 @@
 #!/usr/bin/env python3
 import csv
-import gzip
-import sys
 import glob
+import gzip
+import math
+import sys
 from datetime import datetime, timedelta
-from statistics import mean
 
-# Default file path if no arguments are provided
 DEFAULT_LOG_BASE = "/var/log/pm/pm.log"
 
 
 def parse_timestamp(ts_raw):
-    """Helper to handle various timestamp formats robustly."""
+    """Parse a log timestamp and always return an aware datetime."""
     try:
-        # Handle ISO format (2023-10-01T12:00:00Z)
-        return datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
     except ValueError:
-        try:
-            # Try fallback formats
-            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S'):
-                try:
-                    return datetime.strptime(ts_raw, fmt)
-                except ValueError:
-                    continue
-        except Exception:
-            pass
-    return None
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(ts_raw, fmt)
+                break
+            except ValueError:
+                pass
+        if dt is None:
+            return None
+
+    # ISO log records normally carry an explicit offset.  If an old log does
+    # not, interpret it in the host's local timezone so mixed old/new logs
+    # remain comparable rather than mixing naive and aware datetimes.
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+
+    return dt
 
 
 def open_log(file_path):
     """Open a plain or gzip-compressed log as text."""
-    if file_path.endswith('.gz'):
-        return gzip.open(file_path, mode='rt', encoding='utf-8')
-    return open(file_path, mode='r', encoding='utf-8')
+    if file_path.endswith(".gz"):
+        return gzip.open(file_path, mode="rt", encoding="utf-8", errors="replace")
+    return open(file_path, mode="r", encoding="utf-8", errors="replace")
 
 
-def load_data(file_paths):
-    """Read multiple plain/gzip logs and return one sorted list of data points."""
-    combined_data = []
+def parse_row(row):
+    """Return (timestamp, power_w, energy_kwh), or None for a non-data row."""
+    # Header lines may appear anywhere in rotated logs.  The logger's data
+    # rows begin with YYYY-, which is enough to distinguish them cheaply.
+    if (
+        not row
+        or len(row) < 6
+        or len(row[0]) < 5
+        or not row[0][:4].isdigit()
+        or row[0][4] != "-"
+    ):
+        return None
 
+    ts = parse_timestamp(row[0])
+    if ts is None:
+        return None
+
+    try:
+        power_w = float(row[2])
+        energy_kwh = float(row[5])
+    except (ValueError, IndexError):
+        return None
+
+    # float("nan") and float("inf") are legal Python floats but must not be
+    # allowed to poison the averages or meter delta.
+    if not math.isfinite(power_w) or not math.isfinite(energy_kwh):
+        return None
+
+    return ts, power_w, energy_kwh
+
+
+def iter_records(file_paths, warn=True):
+    """Yield valid records from plain and gzip logs."""
     for file_path in file_paths:
         try:
             with open_log(file_path) as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    # Headers, blank lines, and malformed rows are ignored.
-                    if (
-                        not row
-                        or len(row) < 6
-                        or len(row[0]) < 5
-                        or not row[0][:4].isdigit()
-                        or row[0][4] != '-'
-                    ):
-                        continue
-
-                    ts = parse_timestamp(row[0])
-                    if ts is None:
-                        continue
-
-                    try:
-                        power_val = float(row[2])
-                        energy_kwh = float(row[5])
-                    except (ValueError, IndexError):
-                        continue
-
-                    combined_data.append({
-                        'timestamp': ts,
-                        'power_w': power_val,
-                        'energy_kwh': energy_kwh,
-                    })
+                for row in csv.reader(f):
+                    record = parse_row(row)
+                    if record is not None:
+                        yield record
         except FileNotFoundError:
-            print(f"Warning: {file_path} not found. Skipping...")
+            if warn:
+                print(f"Warning: {file_path} not found. Skipping...", file=sys.stderr)
         except (OSError, gzip.BadGzipFile) as e:
-            print(f"Error reading {file_path}: {e}")
+            if warn:
+                print(f"Error reading {file_path}: {e}", file=sys.stderr)
         except Exception as e:
-            print(f"Error reading {file_path}: {e}")
-
-    # Sort everything by timestamp to ensure timeline continuity across files.
-    combined_data.sort(key=lambda x: x['timestamp'])
-    return combined_data
+            if warn:
+                print(f"Error reading {file_path}: {e}", file=sys.stderr)
 
 
-def sample_average(data):
-    """Arithmetic mean of recorded power samples."""
-    return mean(d['power_w'] for d in data) if data else 0.0
+def scan_global(file_paths):
+    """First pass: global sample stats plus earliest/latest meter records."""
+    count = 0
+    power_sum = 0.0
+    first = None
+    last = None
+
+    for ts, power_w, energy_kwh in iter_records(file_paths):
+        count += 1
+        power_sum += power_w
+        record = (ts, energy_kwh)
+
+        if first is None or ts < first[0]:
+            first = record
+        if last is None or ts > last[0]:
+            last = record
+
+    if count == 0:
+        return None
+
+    return {
+        "count": count,
+        "sample_avg": power_sum / count,
+        "first": first,
+        "last": last,
+    }
 
 
-def meter_average(data):
-    """Average watts from cumulative meter energy over elapsed wall-clock time.
+def meter_average(first, last):
+    """Return (average_w, energy_delta_kwh, elapsed_hours), or None.
 
-    This accounts for periods where logging was absent, provided the plug's
-    cumulative energy counter continued advancing during the gap.
+    This uses the plug's cumulative energy counter at the endpoints, so the
+    result includes calendar time for which no power samples were logged.
+    It assumes the cumulative counter did not reset between the endpoints.
     """
-    if len(data) < 2:
+    first_ts, first_energy = first
+    last_ts, last_energy = last
+
+    elapsed_hours = (last_ts - first_ts).total_seconds() / 3600.0
+    energy_delta = last_energy - first_energy
+
+    if elapsed_hours <= 0 or energy_delta < 0:
         return None
 
-    first = data[0]
-    last = data[-1]
-    elapsed_hours = (last['timestamp'] - first['timestamp']).total_seconds() / 3600.0
-    energy_kwh = last['energy_kwh'] - first['energy_kwh']
-
-    if elapsed_hours <= 0 or energy_kwh < 0:
-        return None
-
-    return energy_kwh * 1000.0 / elapsed_hours
+    return energy_delta * 1000.0 / elapsed_hours, energy_delta, elapsed_hours
 
 
-def analyze_energy(all_data, source_info):
-    """Perform sample-average and meter-derived analysis on the dataset."""
-    if not all_data:
-        print("\nNo valid data found in any provided files.")
-        return
+def make_metrics(first_ts, last_ts):
+    """Return fully-covered sample-average windows.
 
-    last_time = all_data[-1]['timestamp']
-    first_ts = all_data[0]['timestamp']
-
-    metrics = [
-        ("Average Power (Last 10 Min)", last_time - timedelta(minutes=10)),
-        ("Average Power (Last Hour)",   last_time - timedelta(hours=1)),
-        ("Average Power (Last Day)",    last_time - timedelta(days=1)),
-        ("Average Power (Last Week)",   last_time - timedelta(weeks=1)),
-        ("Average Power (MTD)",         last_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)),
-        ("Average Power (YTD)",         last_time.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)),
+    MTD/YTD retain the original behavior: do not claim a complete window if
+    the logs begin after that window started.
+    """
+    candidates = [
+        ("Average Power (Last 10 Min)", last_ts - timedelta(minutes=10)),
+        ("Average Power (Last Hour)", last_ts - timedelta(hours=1)),
+        ("Average Power (Last Day)", last_ts - timedelta(days=1)),
+        ("Average Power (Last Week)", last_ts - timedelta(weeks=1)),
+        (
+            "Average Power (MTD)",
+            last_ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+        ),
+        (
+            "Average Power (YTD)",
+            last_ts.replace(
+                month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+            ),
+        ),
     ]
 
+    # '<' rather than '<=' means a log beginning exactly at the requested
+    # boundary is complete and should be reported.
+    return [(label, threshold) for label, threshold in candidates if first_ts <= threshold]
+
+
+def scan_windows(file_paths, metrics):
+    """Second pass: sample averages for the requested windows."""
+    sums = [0.0] * len(metrics)
+    counts = [0] * len(metrics)
+
+    for ts, power_w, _energy_kwh in iter_records(file_paths, warn=False):
+        for i, (_label, threshold) in enumerate(metrics):
+            if ts >= threshold:
+                sums[i] += power_w
+                counts[i] += 1
+
+    results = []
+    for (label, _threshold), total, count in zip(metrics, sums, counts):
+        if count:
+            results.append((label, total / count))
+
+    return results
+
+
+def analyze_energy(file_paths, source_info):
+    global_stats = scan_global(file_paths)
+    if global_stats is None:
+        print("\nNo valid data found in any provided files.")
+        return 1
+
+    first_ts = global_stats["first"][0]
+    last_ts = global_stats["last"][0]
+    sample_avg = global_stats["sample_avg"]
+    meter_stats = meter_average(global_stats["first"], global_stats["last"])
+
     print(f"\n--- Statistics ({source_info}) ---")
+    print(f"Global Sample Average:     {sample_avg:.2f} W")
 
-    avg_all = sample_average(all_data)
-    weighted_all = meter_average(all_data)
-
-    print(f"Sample Average:            {avg_all:.2f} W")
-    if weighted_all is not None:
-        delta = weighted_all - avg_all
-        pct = (delta / avg_all * 100.0) if avg_all else 0.0
-        print(f"Time-Weighted Average:     {weighted_all:.2f} W")
-        print(f"Difference:                {delta:+.2f} W ({pct:+.1f}%)")
+    if meter_stats is None:
+        print("Global Meter Average:      unavailable")
     else:
-        print("Time-Weighted Average:     unavailable")
+        meter_avg, energy_delta, elapsed_hours = meter_stats
+        delta = meter_avg - sample_avg
+        pct = (delta / sample_avg * 100.0) if sample_avg else 0.0
+        print(f"Global Meter Average:      {meter_avg:.2f} W  (includes logging gaps)")
+        print(f"Difference:                {delta:+.2f} W ({pct:+.1f}%)")
+        print(
+            f"Meter Delta / Elapsed:     {energy_delta:.4f} kWh / "
+            f"{elapsed_hours:.2f} h"
+        )
+
     print()
 
-    plot_results = []
-    for label, threshold in metrics:
-        if threshold <= first_ts:
-            continue  # Skip if the metric period is older than our logs start date.
-
-        period_data = [d for d in all_data if d['timestamp'] >= threshold]
-        if not period_data:
-            continue
-
-        sample_avg = sample_average(period_data)
-        weighted_avg = meter_average(period_data)
-        plot_results.append((label, sample_avg, weighted_avg))
+    metrics = make_metrics(first_ts, last_ts)
+    plot_results = scan_windows(file_paths, metrics)
 
     if not plot_results:
         print("No period-specific metrics available (logs may be too short).")
     else:
-        # --- ASCII BAR PLOT LOGIC ---
-        max_val = max([r[1] for r in plot_results] + [avg_all])
-        bar_width = 54
+        max_val = max([value for _label, value in plot_results] + [sample_avg])
+        bar_width = 60
 
-        print(f"{'Metric':<28} | {'Visual Trend (Sample Avg)':<{bar_width}} | Sample    Meter")
-        print("-" * (31 + bar_width + 24))
+        print(f"{'Metric':<28} | {'Visual Trend (Scaled)':<{bar_width}} | Value")
+        print("-" * (31 + bar_width + 15))
 
-        for label, sample_avg, weighted_avg in plot_results:
-            scaled_len = int((sample_avg / max_val) * bar_width) if max_val > 0 else 0
+        for label, value in plot_results:
+            scaled_len = int((value / max_val) * bar_width) if max_val > 0 else 0
             bar = "█" * scaled_len
-            meter_text = f"{weighted_avg:>7.2f} W" if weighted_avg is not None else "     n/a"
-            print(
-                f"{label:<28} | {bar:<{bar_width}} | "
-                f"{sample_avg:>7.2f} W  {meter_text}"
-            )
+            print(f"{label:<28} | {bar:<{bar_width}} | {value:>7.2f} W")
 
     print()
-    print(f"Data Range:  {first_ts} to {last_time}")
-    print(f"Total Records Analyzed: {len(all_data)}")
+    print(f"Data Range:  {first_ts} to {last_ts}")
+    print(f"Total Records Analyzed: {global_stats['count']}")
+    return 0
 
 
-if __name__ == "__main__":
-    # If user provided arguments, use exactly those files.
-    # If no args, find pm.log and all rotated versions, including .gz files.
-    if len(sys.argv) > 1:
-        files_to_process = sys.argv[1:]
+def main(argv):
+    if len(argv) > 1:
+        files_to_process = argv[1:]
         source_label = f"Specific Files ({', '.join(files_to_process)})"
     else:
         pattern = DEFAULT_LOG_BASE + "*"
         files_to_process = sorted(glob.glob(pattern))
         source_label = f"All logs matching {DEFAULT_LOG_BASE}*"
 
-    data = load_data(files_to_process)
-    analyze_energy(data, source_label)
+    return analyze_energy(files_to_process, source_label)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
