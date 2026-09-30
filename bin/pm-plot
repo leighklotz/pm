@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # --- Configuration & Arguments ---
-DEFAULT_LOG="/var/log/pm/pm.log"
-FILE="$DEFAULT_LOG"
+LOG_DIR="/var/log/pm"
+LOG_GLOB="pm.log*"
+
 SPAN=""
 MODE="both"
 COST_PER_KWH=0.25
@@ -26,7 +27,7 @@ while (( $# > 0 )); do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--span=<interval>] [--cost | --power | --both] [logfile]"
+            echo "Usage: $0 [--span=<interval>] [--cost | --power | --both]"
             exit 0
             ;;
         --*)
@@ -34,22 +35,62 @@ while (( $# > 0 )); do
             exit 2
             ;;
         *)
-            FILE="$1"
-            shift
+            echo "Error: Unexpected argument: $1" >&2
+            exit 2
             ;;
     esac
 done
 
-[[ -f "$FILE" ]] || {
-    echo "Error: File $FILE not found." >&2
+# --- Find Logs, Oldest to Newest ---
+#
+# Supports:
+#
+#   pm.log
+#   pm.log.1
+#   pm.log.2
+#   pm.log.3.gz
+#   ...
+#
+# Files are sorted by modification time.  Plain files are read with cat;
+# gzip-compressed files are read with gzip -cd.
+
+mapfile -t LOG_FILES < <(
+    find "$LOG_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name "$LOG_GLOB" \
+        -printf '%T@ %p\n' |
+    sort -n |
+    cut -d' ' -f2-
+)
+
+(( ${#LOG_FILES[@]} > 0 )) || {
+    echo "Error: No log files found in $LOG_DIR matching $LOG_GLOB" >&2
     exit 1
 }
 
-# --- Time Range Calculation ---
+# Emit all logs as one logical stream.
+read_logs() {
+    local file
+
+    for file in "${LOG_FILES[@]}"; do
+        case "$file" in
+            *.gz)
+                gzip -cd -- "$file"
+                ;;
+            *)
+                cat -- "$file"
+                ;;
+        esac
+    done
+}
+
+# --- Plot Configuration ---
 TERM_WIDTH=132
 TERM_HEIGHT=30
 TARGET_BINS=60
 
+# --- Time Range Calculation ---
 START_EPOCH=""
 END_EPOCH=$(date +%s)
 
@@ -78,18 +119,30 @@ if [[ -n "$SPAN" ]]; then
     esac
 else
     FIRST_LINE=$(
-        awk -F, '$1 ~ /^[0-9]{4}-/ { print; exit }' "$FILE"
+        read_logs |
+        awk -F, '
+            $1 ~ /^[0-9]{4}-/ {
+                print
+                exit
+            }
+        '
     )
 
     LAST_LINE=$(
+        read_logs |
         awk -F, '
-            $1 ~ /^[0-9]{4}-/ { line=$0 }
-            END { if (line != "") print line }
-        ' "$FILE"
+            $1 ~ /^[0-9]{4}-/ {
+                line=$0
+            }
+            END {
+                if (line != "")
+                    print line
+            }
+        '
     )
 
     [[ -n "$FIRST_LINE" && -n "$LAST_LINE" ]] || {
-        echo "Error: No data rows found in $FILE." >&2
+        echo "Error: No data rows found in log files." >&2
         exit 1
     }
 
@@ -127,18 +180,21 @@ BIN_WIDTH=$(( DURATION / TARGET_BINS ))
 #   5 current_a
 #   6 energy_kwh
 #
-# Header lines may appear anywhere in the file.  A real sample begins
-# with a four-digit year followed by "-".
+# Header lines may occur anywhere in any rotated log. A valid data row
+# starts with a four-digit year followed by "-".
 #
 # Power is averaged into display bins.
 #
-# Cost comes directly from the meter's cumulative energy counter.
-# Therefore TARGET_BINS affects only the appearance of the power trace,
-# not the calculated energy cost.
+# Cost is derived directly from the meter's cumulative energy counter,
+# so changing TARGET_BINS changes only plot resolution, not total cost.
+#
+# Blank lines are inserted between widely separated populated bins so
+# gnuplot does not draw misleading lines across large logging gaps.
 
 TMP_DATA=$(mktemp)
 trap 'rm -f "$TMP_DATA"' EXIT
 
+read_logs |
 awk -F, \
     -v start="$START_EPOCH" \
     -v end="$END_EPOCH" \
@@ -149,7 +205,7 @@ BEGIN {
     OFS=" "
 }
 
-# Ignore headers, blank lines, and anything else that is not a data row.
+# Ignore headers, blank lines, and malformed/non-data rows.
 $1 !~ /^[0-9]{4}-/ {
     next
 }
@@ -165,20 +221,20 @@ $1 !~ /^[0-9]{4}-/ {
     watts = $3 + 0
     energy = $6 + 0
 
-    # The first energy reading in the selected range is our cost baseline.
+    # First valid energy reading in the selected range is the zero-cost
+    # baseline for this plot.
     if (!have_first_energy) {
         first_energy = energy
         have_first_energy = 1
     }
 
-    # Display bin relative to the selected start time.
     bin = int((epoch - start) / bw)
     btime = start + bin * bw
 
     sum_w[bin] += watts
     count_w[bin]++
 
-    # Keep the most recent cumulative meter value in each bin.
+    # Keep the latest cumulative energy reading in each display bin.
     last_energy[bin] = energy
     time_of_bin[bin] = btime
 }
@@ -188,6 +244,7 @@ END {
         exit
 
     n = asorti(time_of_bin, keys, "@ind_num_asc")
+    have_prev_bin = 0
 
     for (i = 1; i <= n; i++) {
         b = keys[i]
@@ -195,22 +252,26 @@ END {
         avg_w = sum_w[b] / count_w[b]
 
         used_kwh = last_energy[b] - first_energy
-
-        # The meter should be monotonic.  Do not display negative cost
-        # should a malformed sample ever get through.
         if (used_kwh < 0)
             used_kwh = 0
 
         running_cost = used_kwh * rate
+
+        # Break plotted lines across substantial gaps in the log.
+        if (have_prev_bin && (b - prev_bin) > 2)
+            print ""
 
         cmd = "date -d @" time_of_bin[b] " +%Y-%m-%dT%H:%M:%S"
         cmd | getline t
         close(cmd)
 
         print t, avg_w, running_cost
+
+        prev_bin = b
+        have_prev_bin = 1
     }
 }
-' "$FILE" > "$TMP_DATA"
+' > "$TMP_DATA"
 
 [[ -s "$TMP_DATA" ]] || {
     echo "Error: No samples found in the selected time range." >&2
@@ -218,35 +279,51 @@ END {
 }
 
 # --- Visualization ---
-SPAN_LABEL=${SPAN:-whole file}
+SPAN_LABEL=${SPAN:-all logs}
+LOG_LABEL="$LOG_DIR/$LOG_GLOB"
 
-if [[ "$MODE" == "both" ]]; then
-    gnuplot <<EOF
-        set xdata time; set timefmt '%Y-%m-%dT%H:%M:%S';
-        set title 'Energy Usage: $SPAN_LABEL ($FILE)';
-        set xlabel 'Time'; set ylabel '$ Cumulative';
-        set key outside bottom center horizontal;
-        set y2label '* (Watts/Power)'; set ytics nomirror; set y2tics;
-        set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi;
-        plot '$TMP_DATA' using 1:3 with points pt '\$' title 'Cost ($)', \
-             '' using 1:2 axis x1y2 with lines title 'Power (*)'
-EOF
+case "$MODE" in
+    both)
+        gnuplot <<EOF
+set xdata time
+set timefmt '%Y-%m-%dT%H:%M:%S'
+set title 'Energy Usage: $SPAN_LABEL ($LOG_LABEL)'
+set xlabel 'Time'
+set ylabel '\$ Cumulative'
+set key outside bottom center horizontal
+set y2label '* (Watts/Power)'
+set ytics nomirror
+set y2tics
+set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi
 
-elif [[ "$MODE" == "cost" ]]; then
-    gnuplot <<EOF
-        set xdata time; set timefmt '%Y-%m-%dT%H:%M:%S';
-        set title 'Cumulative Cost: $SPAN_LABEL ($FILE)';
-        set xlabel 'Time'; set ylabel '$ Cumulative';
-        set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi;
-        plot '$TMP_DATA' using 1:3 with lines title 'Cost ($)'
+plot '$TMP_DATA' using 1:3 with points pt '\$' title 'Cost (\$)', \
+     '' using 1:2 axis x1y2 with lines title 'Power (*)'
 EOF
+        ;;
 
-elif [[ "$MODE" == "power" ]]; then
-    gnuplot <<EOF
-        set xdata time; set timefmt '%Y-%m-%dT%H:%M:%S';
-        set title 'Power over Time: $SPAN_LABEL ($FILE)';
-        set xlabel 'Time'; set ylabel '* (Watts)';
-        set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi;
-        plot '$TMP_DATA' using 1:2 with lines title 'Power (*)'
+    cost)
+        gnuplot <<EOF
+set xdata time
+set timefmt '%Y-%m-%dT%H:%M:%S'
+set title 'Cumulative Cost: $SPAN_LABEL ($LOG_LABEL)'
+set xlabel 'Time'
+set ylabel '\$ Cumulative'
+set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi
+
+plot '$TMP_DATA' using 1:3 with lines title 'Cost (\$)'
 EOF
-fi
+        ;;
+
+    power)
+        gnuplot <<EOF
+set xdata time
+set timefmt '%Y-%m-%dT%H:%M:%S'
+set title 'Power over Time: $SPAN_LABEL ($LOG_LABEL)'
+set xlabel 'Time'
+set ylabel '* (Watts)'
+set term dumb size $TERM_WIDTH,$TERM_HEIGHT ansi
+
+plot '$TMP_DATA' using 1:2 with lines title 'Power (*)'
+EOF
+        ;;
+esac
