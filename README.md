@@ -38,7 +38,7 @@ Energy Usage: month (/var/log/pm/pm.log*)
 
 ## Features
 - **Automated Logging**: Runs as a `systemd` service to capture power metrics (Power, Voltage, Current, Total Energy) every 10 seconds in CSV format.
-- **Visualization**: Generates ASCII plots of power over time directly in the terminal using `gnuplot`.
+- **Visualization**: Generates terminal ASCII plots of average power and cumulative electricity cost using `gnuplot`. Reads the complete rotated-log history, including gzip-compressed logs, and preserves visible gaps in recorded data.
 - **Advanced Analysis**: Calculates average wattage across multiple windows: All Time, Last Hour, Last 10 Minutes, Last Day, Last Week, Month to Date (MTD), and Year to Date (YTD).
 
 ## Prerequisites
@@ -46,6 +46,8 @@ Ensure the following tools are installed on your system:
 - `curl` - To fetch data from the API.
 - `jq` - To parse JSON responses.
 - `gnuplot` - For generating terminal plots.
+- `gzip` - To read compressed rotated log files.
+- GNU core utilities plus `find` and `awk` - Used by the Bash plotting tools.
 - `python3` - For running analysis scripts.
 
 ## Installation
@@ -74,11 +76,41 @@ tail -f /var/log/pm/pm.log
 ```
 
 ### 2. Plotting Data (One-off)
-To see a terminal-based line graph of the power consumption over time:
+
+`pm-plot` automatically reads all power-monitor logs in `/var/log/pm`,
+including rotated and gzip-compressed logs such as:
+
+- `pm.log`
+- `pm.log.1`
+- `pm.log.2`
+- `pm.log.3.gz`
+
 ```bash
-bin/pm-plot [/path/to/your/logfile]
+# Plot all available history
+bin/pm-plot
+
+# Limit the displayed time range
+bin/pm-plot --span=hour
+bin/pm-plot --span=day
+bin/pm-plot --span=week
+bin/pm-plot --span=month
+bin/pm-plot --span=ytd
+
+# Select plotted data
+bin/pm-plot --cost
+bin/pm-plot --power
+bin/pm-plot --both
 ```
-*(Defaults to `/var/log/pm/pm.log` if no argument is provided)*
+
+The default is `--both`.
+
+Power samples are averaged into display bins. Cumulative cost is calculated
+from the smart plug's cumulative `energy_kwh` meter rather than from the
+display bins, so changing plot resolution does not change the calculated cost.
+
+Large gaps in logging are shown as gaps in the power trace rather than being
+interpolated across missing data. CSV header lines may occur anywhere in the
+rotated logs and are ignored automatically.
 
 ### 3. Watching Data (Live Update)
 To run the plot in a loop, updating every 10 seconds:
@@ -97,7 +129,7 @@ bin/pm-stats [/path/to/your/logfile]
 - `lib/daemon.sh`: The core script that polls the API and writes CSV data to a log file.
 - `/etc/pm.service`: Systemd unit file for persistent background execution.
 - `./install.sh`: Helper script to automate service installation and setup.
-- `bin/pm-plot`: Bash script using `gnuplot` to render ASCII line charts.
+- `bin/pm-plot`: Bash/gnuplot terminal plotter that reads plain and gzip-compressed rotated logs, plots binned power, and calculates cumulative cost from the plug's energy meter.
 - `bin/pm-watch`: A wrapper that uses `watch` to refresh the plot automatically.
 - `bin/pm-stats`: Python engine for calculating statistical averages across various time windows with visual bar trends.
 ```
